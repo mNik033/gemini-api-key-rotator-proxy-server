@@ -8,6 +8,7 @@ import time
 import asyncio
 import json
 import random
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
@@ -17,7 +18,21 @@ import httpx
 import logging
 
 log = logging.getLogger("uvicorn")
-APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)")
+HTTP_CLIENT: httpx.AsyncClient = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout=300.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    yield
+    await HTTP_CLIENT.aclose()
+
+
+APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)", lifespan=lifespan)
 
 # -------------------------
 # Config
@@ -334,7 +349,7 @@ async def catch_all(request: Request, full_path: str):
 
                 if DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
                 try:
-                    async with httpx.AsyncClient(timeout=300) as client, client.stream(
+                    async with HTTP_CLIENT.stream(
                         request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
                     ) as upstream:
                         if upstream.status_code >= 400:
@@ -411,8 +426,7 @@ async def catch_all(request: Request, full_path: str):
 
             if DEBUG: print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url}")
             try:
-                async with httpx.AsyncClient(timeout=300) as client:
-                    resp = await client.request(request.method, upstream_url, headers=headers_auth, params=params_auth, content=content)
+                resp = await HTTP_CLIENT.request(request.method, upstream_url, headers=headers_auth, params=params_auth, content=content)
                 
                 if resp.status_code < 400:
                     key_state.mark_success()
