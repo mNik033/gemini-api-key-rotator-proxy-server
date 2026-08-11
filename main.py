@@ -78,14 +78,20 @@ class KeyState:
         self.banned_until: float = 0.0
         self.success: int = 0
         self.fail: int = 0
+        self.status_text: str = "active"
 
     def is_available(self) -> bool:
-        return time.monotonic() >= self.banned_until
+        if time.monotonic() >= self.banned_until:
+            if self.status_text != "active":
+                self.status_text = "active"
+            return True
+        return False
 
     def mark_success(self) -> None:
         self.backoff = 0.0
         self.banned_until = 0.0
         self.success += 1
+        self.status_text = "active"
 
     def mark_rate_limited(self, retry_after: float = None) -> None:
         """429 RPM/TPM hit. Respect Retry-After if provided, otherwise short fixed wait."""
@@ -93,6 +99,7 @@ class KeyState:
         self.banned_until = time.monotonic() + wait
         self.backoff = wait
         self.fail += 1
+        self.status_text = "rate_limited"
 
     def mark_daily_exhausted(self) -> None:
         """429 daily quota. Park until midnight Pacific (8:00 AM UTC)."""
@@ -104,6 +111,7 @@ class KeyState:
         self.banned_until = time.monotonic() + wait
         self.backoff = wait
         self.fail += 1
+        self.status_text = "daily_exhausted"
         log.warning(f"Key {self.key[:12]}... daily quota exhausted, parked until {target.isoformat()}")
 
     def mark_auth_error(self) -> None:
@@ -111,6 +119,7 @@ class KeyState:
         self.banned_until = time.monotonic() + BACKOFF_MAX
         self.backoff = BACKOFF_MAX
         self.fail += 1
+        self.status_text = "auth_error"
         log.error(f"Key {self.key[:12]}... auth error, backoff {BACKOFF_MAX}s")
 
     def mark_server_error(self) -> None:
@@ -118,6 +127,7 @@ class KeyState:
         wait = min(BACKOFF_MIN, 3.0)
         self.banned_until = time.monotonic() + wait
         self.fail += 1
+        self.status_text = "server_error"
 
     def mark_failure(self) -> None:
         """Generic fallback. Exponential backoff for unclassified errors."""
@@ -127,6 +137,7 @@ class KeyState:
             self.backoff = min(BACKOFF_MAX, self.backoff * 2.0)
         self.banned_until = time.monotonic() + self.backoff
         self.fail += 1
+        self.status_text = "error"
 
 
 class KeyPool:
@@ -153,6 +164,7 @@ class KeyPool:
         for s in self.states:
             out.append({
                 "key_preview": (s.key[:12] + "...") if len(s.key) > 8 else s.key,
+                "status": s.status_text if s.banned_until > now else "active",
                 "available_in": max(0, round(s.banned_until - now, 2)),
                 "backoff": s.backoff,
                 "success": s.success,
