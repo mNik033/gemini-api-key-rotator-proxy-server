@@ -150,28 +150,52 @@ def detect_stream_from_request(content_bytes: Optional[bytes], query_params: Dic
     return False
 
 
+def _is_oauth_token(key: str) -> bool:
+    """Detect if a credential is an OAuth/service account token rather than an API key.
+
+    Instead of trying to match API key prefixes (which Google changes — AIza, AQ, etc.),
+    we detect OAuth tokens by their stable, distinctive patterns and default everything
+    else to API key.
+
+    OAuth/Bearer tokens have recognizable characteristics:
+    - Google OAuth2 access tokens start with 'ya29.'
+    - JWT tokens have 3 dot-separated segments (header.payload.signature)
+    - Service account / long-lived tokens are typically much longer than API keys (~39 chars)
+    """
+    # Google OAuth2 access tokens
+    if key.startswith("ya29."):
+        return True
+    # JWT format: three base64 segments separated by dots
+    if key.count(".") >= 2:
+        return True
+    # Unusually long credentials are likely OAuth tokens (API keys are ~39 chars)
+    if len(key) > 200:
+        return True
+    return False
+
+
 def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict[str, Any], key_state: KeyState):
     """
     Return (headers_copy, params_copy) where authentication for key_state.key is applied.
-    - If key looks like API key (starts with 'AIza'), put it as params['key'].
-    - Otherwise set Authorization: Bearer <key>.
+    - If key looks like an OAuth/Bearer token, set Authorization header.
+    - Otherwise (default) treat as API key and pass via query param.
     """
     headers = dict(incoming_headers)
     params = dict(incoming_params) if incoming_params is not None else {}
 
     k = key_state.key.strip()
-    # heuristic: Google API keys usually start with "AIza"
-    if k.startswith("AIza"):
-        # use query parameter 'key' for API key (do not set Authorization)
+
+    if _is_oauth_token(k):
+        # OAuth access token / service account token → Authorization header
+        headers['Authorization'] = f"Bearer {k}"
+        auth_mode = "bearer_header"
+    else:
+        # Default: treat as API key → query parameter 'key'
         params['key'] = k
         if 'authorization' in {x.lower() for x in headers.keys()}:
             # remove incoming Authorization to avoid confusion
             headers = {hk: hv for hk, hv in headers.items() if hk.lower() != 'authorization'}
         auth_mode = "api_key(query)"
-    else:
-        # assume OAuth access token / service account token etc.
-        headers['Authorization'] = f"Bearer {k}"
-        auth_mode = "bearer_header"
     if DEBUG:
         print(f"[DEBUG] auth mode {auth_mode} for key preview {k[:12]}...")
     return headers, params
