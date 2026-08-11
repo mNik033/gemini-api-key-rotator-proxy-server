@@ -3,10 +3,12 @@
 # pip install fastapi uvicorn httpx
 
 import os
+import re
 import time
 import asyncio
 import json
 import random
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -52,7 +54,7 @@ def load_keys_from_file(path: str) -> List[str]:
 KEYS_LIST = load_keys_from_file(KEYS_FILE)
 
 # -------------------------
-# Key state & pool (simple backoff-based)
+# Key state & pool (classified error handling)
 # -------------------------
 class KeyState:
     def __init__(self, key: str):
@@ -70,7 +72,40 @@ class KeyState:
         self.banned_until = 0.0
         self.success += 1
 
+    def mark_rate_limited(self, retry_after: float = None) -> None:
+        """429 RPM/TPM hit. Respect Retry-After if provided, otherwise short fixed wait."""
+        wait = retry_after if retry_after and retry_after > 0 else BACKOFF_MIN
+        self.banned_until = time.monotonic() + wait
+        self.backoff = wait
+        self.fail += 1
+
+    def mark_daily_exhausted(self) -> None:
+        """429 daily quota. Park until midnight Pacific (8:00 AM UTC)."""
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait = (target - now).total_seconds()
+        self.banned_until = time.monotonic() + wait
+        self.backoff = wait
+        self.fail += 1
+        log.warning(f"Key {self.key[:12]}... daily quota exhausted, parked until {target.isoformat()}")
+
+    def mark_auth_error(self) -> None:
+        """401/403 or invalid key. Long backoff."""
+        self.banned_until = time.monotonic() + BACKOFF_MAX
+        self.backoff = BACKOFF_MAX
+        self.fail += 1
+        log.error(f"Key {self.key[:12]}... auth error, backoff {BACKOFF_MAX}s")
+
+    def mark_server_error(self) -> None:
+        """500/502/503 transient. Short fixed wait, no exponential escalation."""
+        wait = min(BACKOFF_MIN, 3.0)
+        self.banned_until = time.monotonic() + wait
+        self.fail += 1
+
     def mark_failure(self) -> None:
+        """Generic fallback. Exponential backoff for unclassified errors."""
         if self.backoff <= 0:
             self.backoff = BACKOFF_MIN
         else:
@@ -202,6 +237,68 @@ def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict
 
 
 # -------------------------
+# Error classification
+# -------------------------
+def _classify_upstream_error(status_code: int, body: str) -> str:
+    """Classify upstream HTTP errors to decide how to penalize the key.
+
+    Returns:
+        "rate_limited"     - 429 RPM/TPM limit, short backoff
+        "daily_exhausted"  - 429 daily quota, park until midnight Pacific
+        "auth_error"       - 401/403 or invalid-key 400, the key itself is bad
+        "client_error"     - 400/404/etc, the request is bad (don't penalize key)
+        "server_error"     - 500/502/503, transient upstream issue
+    """
+    if status_code == 429:
+        body_lower = body.lower()
+        if "perday" in body_lower or "per_day" in body_lower or "daily" in body_lower:
+            return "daily_exhausted"
+        return "rate_limited"
+    if status_code in (401, 403):
+        return "auth_error"
+    if status_code == 400:
+        body_lower = body.lower()
+        if "api key not valid" in body_lower or "api_key_invalid" in body_lower:
+            return "auth_error"
+        return "client_error"
+    if status_code in (500, 502, 503):
+        return "server_error"
+    if 400 <= status_code < 500:
+        return "client_error"
+    return "server_error"
+
+
+def _parse_retry_after(headers: dict, body: str) -> Optional[float]:
+    """Extract retry wait time from response headers or Gemini error body."""
+    ra = headers.get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except ValueError:
+            pass
+    match = re.search(r"retryDelay.*?(\d+(?:\.\d+)?)s", body)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _penalize_key(key_state: KeyState, classification: str, retry_after: float = None) -> None:
+    """Apply the right penalty for the error type. Client errors skip penalty entirely."""
+    if classification == "rate_limited":
+        key_state.mark_rate_limited(retry_after)
+    elif classification == "daily_exhausted":
+        key_state.mark_daily_exhausted()
+    elif classification == "auth_error":
+        key_state.mark_auth_error()
+    elif classification == "server_error":
+        key_state.mark_server_error()
+    elif classification == "client_error":
+        pass  # not the key's fault
+    else:
+        key_state.mark_failure()
+
+
+# -------------------------
 # Catch-all proxy endpoint
 # -------------------------
 @APP.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
@@ -241,32 +338,42 @@ async def catch_all(request: Request, full_path: str):
                         request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
                     ) as upstream:
                         if upstream.status_code >= 400:
-                            key_state.mark_failure()
                             body = await upstream.aread()
-                            logged_errors.append({"key": key_state.key[:12], "status": upstream.status_code, "body": body.decode(errors='ignore')})
-                            log.warning(f"Key {key_state.key[:12]}... failed on stream connection with status {upstream.status_code}. Retrying...")
+                            body_str = body.decode(errors='ignore')
+                            classification = _classify_upstream_error(upstream.status_code, body_str)
+                            retry_after = _parse_retry_after(dict(upstream.headers), body_str)
+                            _penalize_key(key_state, classification, retry_after)
+                            logged_errors.append({"key": key_state.key[:12], "status": upstream.status_code, "type": classification, "body": body_str[:300]})
+                            log.warning(f"Key {key_state.key[:12]}... stream {classification} (status {upstream.status_code})")
+                            # client errors won't be fixed by trying another key
+                            if classification == "client_error":
+                                yield body
+                                return
                             continue
 
                         is_first_chunk, stream_had_error = True, False
                         async for chunk in upstream.aiter_bytes():
                             if is_first_chunk:
                                 is_first_chunk = False
-                                # Gemini streams a 'data: ' prefix, which we can ignore for error checking
                                 chunk_content_for_check = chunk
                                 if chunk_content_for_check.startswith(b'data: '):
                                     chunk_content_for_check = chunk_content_for_check[len(b'data: '):]
                                 
                                 try:
-                                    # The first chunk might be a list with a single error object
                                     data = json.loads(chunk_content_for_check.decode())
-                                    if isinstance(data, list): data = data
+                                    # unwrap single-element list errors
+                                    if isinstance(data, list) and len(data) == 1:
+                                        data = data[0]
 
                                     if isinstance(data, dict) and "error" in data:
-                                        key_state.mark_failure()
+                                        err = data.get("error", {})
+                                        msg = err.get("message", "Unknown stream error")
+                                        code = err.get("code", 500)
+                                        classification = _classify_upstream_error(code if isinstance(code, int) else 500, msg)
+                                        _penalize_key(key_state, classification)
                                         stream_had_error = True
-                                        msg = data.get("error", {}).get("message", "Unknown stream error")
-                                        logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "body": msg})
-                                        if DEBUG: print(f"[DEBUG] In-stream error for key {key_state.key[:12]}...: {msg}")
+                                        logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "type": classification, "body": msg})
+                                        if DEBUG: print(f"[DEBUG] In-stream {classification} for key {key_state.key[:12]}...: {msg}")
                                         break 
                                 except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
                             yield chunk
@@ -277,9 +384,9 @@ async def catch_all(request: Request, full_path: str):
                         log.info(f"Stream{client_info} completed successfully with key {key_state.key[:12]}...")
                         return
                 except httpx.RequestError as e:
-                    key_state.mark_failure()
+                    key_state.mark_server_error()  # network issue, not the key's fault
                     logged_errors.append({"key": key_state.key[:12], "error": str(e)})
-                    if DEBUG: print(f"[DEBUG] Request error for stream key {key_state.key[:12]}...: {e}")
+                    if DEBUG: print(f"[DEBUG] Network error for stream key {key_state.key[:12]}...: {e}")
                     continue
             
             if not tried_keys:
@@ -313,23 +420,25 @@ async def catch_all(request: Request, full_path: str):
                     log.info(f"Request{client_info} completed successfully with key {key_state.key[:12]}...")
                     return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
-                # It's an error, mark failure
-                key_state.mark_failure()
+                # classify the error and penalize accordingly
                 error_body_str = resp.text
-                if DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... failed with status {resp.status_code}, body: {error_body_str[:200]}")
+                classification = _classify_upstream_error(resp.status_code, error_body_str)
+                retry_after = _parse_retry_after(dict(resp.headers), error_body_str)
+                _penalize_key(key_state, classification, retry_after)
+                if DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... {classification} (status {resp.status_code})")
 
-                # Also treat 400 as retryable for cases like invalid API keys
-                if resp.status_code in (400, 429, 500, 502, 503):
-                    errors.append({"key_preview": key_state.key[:12] + "...", "error": error_body_str, "status_code": resp.status_code})
-                    continue # Retryable error, try next key
-                else:
-                    # Non-retryable error, return immediately
+                # client errors mean the request is bad, not the key. return immediately.
+                if classification == "client_error":
                     return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
+                # key-related errors: log and try the next key
+                errors.append({"key_preview": key_state.key[:12] + "...", "type": classification, "status_code": resp.status_code, "error": error_body_str[:300]})
+                continue
+
             except httpx.RequestError as e:
-                key_state.mark_failure()
+                key_state.mark_server_error()  # network issue, light penalty
                 errors.append({"key_preview": key_state.key[:12] + "...", "error": str(e)})
-                if DEBUG: print(f"[DEBUG] Request error for key {key_state.key[:12]}...: {e}")
+                if DEBUG: print(f"[DEBUG] Network error for key {key_state.key[:12]}...: {e}")
                 continue
 
         if not tried:
