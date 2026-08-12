@@ -11,6 +11,7 @@ import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import Response, JSONResponse, StreamingResponse
@@ -37,19 +38,27 @@ APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)", lifespan=life
 # -------------------------
 # Config
 # -------------------------
-VPN_PROXY_URL = ""  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
-KEYS_FILE = "api_keys.txt" # api keys, one per line
-ADMIN_TOKEN = "changeme_local_only"
-UPSTREAM_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta"
-BACKOFF_MIN = 5
-BACKOFF_MAX = 600
-DEBUG = False
+class Settings(BaseSettings):
+    GEMINI_API_KEYS: str = ""
+    ADMIN_TOKEN: str = "changeme_local_only"
+    UPSTREAM_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
+    VPN_PROXY_URL: str = ""
+    BACKOFF_MIN: float = 5.0
+    BACKOFF_MAX: float = 600.0
+    DEBUG: bool = False
+    HOST: str = "127.0.0.1"
+    PORT: int = 8000
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+CONFIG = Settings()
+
 
 # -------------------------
 # Setup proxy from config (optional http proxy)
 # -------------------------
-if VPN_PROXY_URL:
-    proxy_url_with_scheme = VPN_PROXY_URL if "://" in VPN_PROXY_URL else f"http://{VPN_PROXY_URL}"
+if CONFIG.VPN_PROXY_URL:
+    proxy_url_with_scheme = CONFIG.VPN_PROXY_URL if "://" in CONFIG.VPN_PROXY_URL else f"http://{CONFIG.VPN_PROXY_URL}"
     os.environ['HTTP_PROXY'] = proxy_url_with_scheme
     os.environ['HTTPS_PROXY'] = proxy_url_with_scheme
     os.environ['ALL_PROXY'] = proxy_url_with_scheme
@@ -57,16 +66,13 @@ if VPN_PROXY_URL:
 # -------------------------
 # Utilities: load keys
 # -------------------------
-def load_keys_from_file(path: str) -> List[str]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"API keys file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        keys = [line.strip() for line in f if line.strip()]
+def parse_keys(keys_str: str) -> List[str]:
+    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     if not keys:
-        raise RuntimeError("No API keys found in file.")
+        raise RuntimeError("No API keys found in GEMINI_API_KEYS environment variable.")
     return keys
 
-KEYS_LIST = load_keys_from_file(KEYS_FILE)
+KEYS_LIST = parse_keys(CONFIG.GEMINI_API_KEYS)
 
 # -------------------------
 # Key state & pool (classified error handling)
@@ -95,7 +101,7 @@ class KeyState:
 
     def mark_rate_limited(self, retry_after: float = None) -> None:
         """429 RPM/TPM hit. Respect Retry-After if provided, otherwise short fixed wait."""
-        wait = retry_after if retry_after and retry_after > 0 else BACKOFF_MIN
+        wait = retry_after if retry_after and retry_after > 0 else CONFIG.BACKOFF_MIN
         self.banned_until = time.monotonic() + wait
         self.backoff = wait
         self.fail += 1
@@ -116,15 +122,15 @@ class KeyState:
 
     def mark_auth_error(self) -> None:
         """401/403 or invalid key. Long backoff."""
-        self.banned_until = time.monotonic() + BACKOFF_MAX
-        self.backoff = BACKOFF_MAX
+        self.banned_until = time.monotonic() + CONFIG.BACKOFF_MAX
+        self.backoff = CONFIG.BACKOFF_MAX
         self.fail += 1
         self.status_text = "auth_error"
-        log.error(f"Key {self.key[:12]}... auth error, backoff {BACKOFF_MAX}s")
+        log.error(f"Key {self.key[:12]}... auth error, backoff {CONFIG.BACKOFF_MAX}s")
 
     def mark_server_error(self) -> None:
         """500/502/503 transient. Short fixed wait, no exponential escalation."""
-        wait = min(BACKOFF_MIN, 3.0)
+        wait = min(CONFIG.BACKOFF_MIN, 3.0)
         self.banned_until = time.monotonic() + wait
         self.fail += 1
         self.status_text = "server_error"
@@ -132,9 +138,9 @@ class KeyState:
     def mark_failure(self) -> None:
         """Generic fallback. Exponential backoff for unclassified errors."""
         if self.backoff <= 0:
-            self.backoff = BACKOFF_MIN
+            self.backoff = CONFIG.BACKOFF_MIN
         else:
-            self.backoff = min(BACKOFF_MAX, self.backoff * 2.0)
+            self.backoff = min(CONFIG.BACKOFF_MAX, self.backoff * 2.0)
         self.banned_until = time.monotonic() + self.backoff
         self.fail += 1
         self.status_text = "error"
@@ -189,9 +195,9 @@ def map_incoming_to_upstream(path: str) -> str:
     elif p.startswith("v1beta/"):
         p = p[len("v1beta/"):]
     # avoid trailing slash duplication
-    if p == "":
-        return UPSTREAM_BASE_GEMINI.rstrip("/")
-    return UPSTREAM_BASE_GEMINI.rstrip("/") + "/" + p
+    if not p:
+        return CONFIG.UPSTREAM_BASE.rstrip("/")
+    return CONFIG.UPSTREAM_BASE.rstrip("/") + "/" + p
 
 
 def detect_stream_from_request(content_bytes: Optional[bytes], query_params: Dict[str, Any]) -> bool:
@@ -258,7 +264,7 @@ def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict
             # remove incoming Authorization to avoid confusion
             headers = {hk: hv for hk, hv in headers.items() if hk.lower() != 'authorization'}
         auth_mode = "api_key(query)"
-    if DEBUG:
+    if CONFIG.DEBUG:
         print(f"[DEBUG] auth mode {auth_mode} for key preview {k[:12]}...")
     return headers, params
 
@@ -359,7 +365,7 @@ async def catch_all(request: Request, full_path: str):
                 if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                     headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
-                if DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
+                if CONFIG.DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
                 try:
                     async with HTTP_CLIENT.stream(
                         request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
@@ -400,7 +406,7 @@ async def catch_all(request: Request, full_path: str):
                                         _penalize_key(key_state, classification)
                                         stream_had_error = True
                                         logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "type": classification, "body": msg})
-                                        if DEBUG: print(f"[DEBUG] In-stream {classification} for key {key_state.key[:12]}...: {msg}")
+                                        if CONFIG.DEBUG: print(f"[DEBUG] In-stream {classification} for key {key_state.key[:12]}...: {msg}")
                                         break 
                                 except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
                             yield chunk
@@ -413,7 +419,7 @@ async def catch_all(request: Request, full_path: str):
                 except httpx.RequestError as e:
                     key_state.mark_server_error()  # network issue, not the key's fault
                     logged_errors.append({"key": key_state.key[:12], "error": str(e)})
-                    if DEBUG: print(f"[DEBUG] Network error for stream key {key_state.key[:12]}...: {e}")
+                    if CONFIG.DEBUG: print(f"[DEBUG] Network error for stream key {key_state.key[:12]}...: {e}")
                     continue
             
             if not tried_keys:
@@ -436,7 +442,7 @@ async def catch_all(request: Request, full_path: str):
             if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                 headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
-            if DEBUG: print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url}")
+            if CONFIG.DEBUG: print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url}")
             try:
                 resp = await HTTP_CLIENT.request(request.method, upstream_url, headers=headers_auth, params=params_auth, content=content)
                 
@@ -451,7 +457,7 @@ async def catch_all(request: Request, full_path: str):
                 classification = _classify_upstream_error(resp.status_code, error_body_str)
                 retry_after = _parse_retry_after(dict(resp.headers), error_body_str)
                 _penalize_key(key_state, classification, retry_after)
-                if DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... {classification} (status {resp.status_code})")
+                if CONFIG.DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... {classification} (status {resp.status_code})")
 
                 # client errors mean the request is bad, not the key. return immediately.
                 if classification == "client_error":
@@ -464,7 +470,7 @@ async def catch_all(request: Request, full_path: str):
             except httpx.RequestError as e:
                 key_state.mark_server_error()  # network issue, light penalty
                 errors.append({"key_preview": key_state.key[:12] + "...", "error": str(e)})
-                if DEBUG: print(f"[DEBUG] Network error for key {key_state.key[:12]}...: {e}")
+                if CONFIG.DEBUG: print(f"[DEBUG] Network error for key {key_state.key[:12]}...: {e}")
                 continue
 
         if not tried:
@@ -479,11 +485,11 @@ async def catch_all(request: Request, full_path: str):
 def is_admin(auth_header: Optional[str]) -> bool:
     if not auth_header:
         return False
-    if auth_header == ADMIN_TOKEN:
+    if auth_header == CONFIG.ADMIN_TOKEN:
         return True
     low = auth_header.lower()
     if low.startswith("bearer "):
-        return auth_header.split(" ", 1) == ADMIN_TOKEN
+        return auth_header.split(" ", 1) == CONFIG.ADMIN_TOKEN
     return False
 
 
@@ -498,8 +504,10 @@ async def status(x_proxy_admin: Optional[str] = Header(None)):
 async def reload_keys(x_proxy_admin: Optional[str] = Header(None)):
     if not is_admin(x_proxy_admin):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    global KEYS_LIST, POOL
-    KEYS_LIST = load_keys_from_file(KEYS_FILE)
+    global CONFIG, KEYS_LIST, POOL
+    # Re-instantiate Settings to pull fresh environment variables if they changed
+    CONFIG = Settings()
+    KEYS_LIST = parse_keys(CONFIG.GEMINI_API_KEYS)
     POOL = KeyPool(KEYS_LIST)
     return JSONResponse({"reloaded": True, "num_keys": len(KEYS_LIST)})
 
