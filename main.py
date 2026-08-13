@@ -8,6 +8,7 @@ import time
 import asyncio
 import json
 import random
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
     HTTP_CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(timeout=300.0, connect=10.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        proxy=PROXY_URL,
     )
     yield
     await HTTP_CLIENT.aclose()
@@ -43,6 +45,8 @@ class Settings(BaseSettings):
     ADMIN_TOKEN: str = "changeme_local_only"
     UPSTREAM_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
     VPN_PROXY_URL: str = ""
+    PROXY_USERNAME: str = ""
+    PROXY_PASSWORD: str = ""
     BACKOFF_MIN: float = 5.0
     BACKOFF_MAX: float = 600.0
     DEBUG: bool = False
@@ -55,13 +59,22 @@ CONFIG = Settings()
 
 
 # -------------------------
-# Setup proxy from config (optional http proxy)
+# Build proxy URL with properly encoded credentials
 # -------------------------
-if CONFIG.VPN_PROXY_URL:
-    proxy_url_with_scheme = CONFIG.VPN_PROXY_URL if "://" in CONFIG.VPN_PROXY_URL else f"http://{CONFIG.VPN_PROXY_URL}"
-    os.environ['HTTP_PROXY'] = proxy_url_with_scheme
-    os.environ['HTTPS_PROXY'] = proxy_url_with_scheme
-    os.environ['ALL_PROXY'] = proxy_url_with_scheme
+def build_proxy_url(cfg: Settings) -> Optional[str]:
+    if not cfg.VPN_PROXY_URL:
+        return None
+    base = cfg.VPN_PROXY_URL if "://" in cfg.VPN_PROXY_URL else f"http://{cfg.VPN_PROXY_URL}"
+    if not cfg.PROXY_USERNAME:
+        return base
+    # URL-encode username and password
+    encoded_user = urllib.parse.quote(cfg.PROXY_USERNAME, safe="")
+    encoded_pass = urllib.parse.quote(cfg.PROXY_PASSWORD, safe="")
+    # Insert credentials into the URL: http://user:pass@host:port
+    scheme_end = base.index("://") + 3
+    return f"{base[:scheme_end]}{encoded_user}:{encoded_pass}@{base[scheme_end:]}"
+
+PROXY_URL = build_proxy_url(CONFIG)
 
 # -------------------------
 # Utilities: load keys
