@@ -4,6 +4,7 @@
 
 import os
 import re
+import ssl
 import time
 import asyncio
 import json
@@ -19,6 +20,13 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 import httpx
 import logging
 
+try:
+    import truststore
+    truststore.inject_into_ssl()
+    _HAS_TRUSTSTORE = True
+except ImportError:
+    _HAS_TRUSTSTORE = False
+
 log = logging.getLogger("uvicorn")
 HTTP_CLIENT: httpx.AsyncClient = None
 
@@ -26,10 +34,17 @@ HTTP_CLIENT: httpx.AsyncClient = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global HTTP_CLIENT
+    # SSL verification: truststore uses the OS cert store,
+    # VERIFY_SSL=false disables verification entirely as a last resort
+    verify = CONFIG.VERIFY_SSL
+    if not _HAS_TRUSTSTORE and verify:
+        log.warning("truststore not installed, using Python's default CA bundle. "
+                    "Install truststore to use the OS certificate store.")
     HTTP_CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(timeout=300.0, connect=10.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         proxy=PROXY_URL,
+        verify=verify,
     )
     yield
     await HTTP_CLIENT.aclose()
@@ -49,6 +64,7 @@ class Settings(BaseSettings):
     PROXY_PASSWORD: str = ""
     BACKOFF_MIN: float = 5.0
     BACKOFF_MAX: float = 600.0
+    VERIFY_SSL: bool = True
     DEBUG: bool = False
     HOST: str = "127.0.0.1"
     PORT: int = 8000
