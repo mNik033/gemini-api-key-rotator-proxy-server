@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     BACKOFF_MIN: float = 5.0
     BACKOFF_MAX: float = 600.0
     VERIFY_SSL: bool = True
+    ENABLE_THINKING_CHAIN: bool = False
     DEBUG: bool = False
     HOST: str = "127.0.0.1"
     PORT: int = 8000
@@ -223,6 +224,11 @@ def map_incoming_to_upstream(path: str) -> str:
         p = p[len("v1/"):]
     elif p.startswith("v1beta/"):
         p = p[len("v1beta/"):]
+        
+    # Detect OpenAI compatible routes
+    if p.startswith("chat/completions") or p.startswith("models") or p.startswith("embeddings"):
+        return CONFIG.UPSTREAM_BASE.rstrip("/") + "/openai/" + p
+
     # avoid trailing slash duplication
     if not p:
         return CONFIG.UPSTREAM_BASE.rstrip("/")
@@ -376,6 +382,18 @@ async def catch_all(request: Request, full_path: str):
         k: v for k, v in request.headers.items()
         if k.lower() in _FORWARDED_HEADERS
     }
+
+    if CONFIG.ENABLE_THINKING_CHAIN and content and "/openai/" in upstream_url:
+        try:
+            body_json = json.loads(content.decode(errors="ignore"))
+            if "extra_body" not in body_json or "google" not in body_json.get("extra_body", {}):
+                body_json.setdefault("extra_body", {}).setdefault("google", {}).setdefault("thinking_config", {
+                    "thinking_budget": 32768,
+                    "include_thoughts": True
+                })
+                content = json.dumps(body_json).encode("utf-8")
+        except Exception:
+            pass
 
     is_stream = detect_stream_from_request(content if content else None, params)
 
