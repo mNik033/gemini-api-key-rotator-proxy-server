@@ -277,9 +277,10 @@ def _is_oauth_token(key: str) -> bool:
     return False
 
 
-def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict[str, Any], key_state: KeyState):
+def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict[str, Any], key_state: KeyState, is_openai: bool = False):
     """
     Return (headers_copy, params_copy) where authentication for key_state.key is applied.
+    - If is_openai is True, ALWAYS use Authorization header.
     - If key looks like an OAuth/Bearer token, set Authorization header.
     - Otherwise (default) treat as API key and pass via query param.
     """
@@ -288,8 +289,8 @@ def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict
 
     k = key_state.key.strip()
 
-    if _is_oauth_token(k):
-        # OAuth access token / service account token → Authorization header
+    if is_openai or _is_oauth_token(k):
+        # OpenAI endpoint or OAuth access token → Authorization header
         headers['Authorization'] = f"Bearer {k}"
         auth_mode = "bearer_header"
     else:
@@ -410,7 +411,8 @@ async def catch_all(request: Request, full_path: str):
                 key_state = await POOL.next_available()
                 if not key_state: break
                 tried_keys.append(key_state.key[:12] + "...")
-                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+                is_openai = "/openai/" in upstream_url
+                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai)
                 if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                     headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
@@ -487,7 +489,8 @@ async def catch_all(request: Request, full_path: str):
             key_state = await POOL.next_available()
             if not key_state: break
             tried.append(key_state.key[:12] + "...")
-            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+            is_openai = "/openai/" in upstream_url
+            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai)
             if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                 headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
