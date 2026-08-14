@@ -369,10 +369,12 @@ async def catch_all(request: Request, full_path: str):
     content = await request.body()
     params = dict(request.query_params)
 
-    # copy incoming headers but skip hop-by-hop
+    # Only forward safe headers to Gemini. Being too permissive here causes 400 errors
+    # from extension-specific headers (x-stainless-*, accept-encoding, etc.)
+    _FORWARDED_HEADERS = {"content-type", "accept", "authorization", "x-goog-api-key", "x-goog-api-client"}
     incoming_headers: Dict[str, str] = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
+        if k.lower() in _FORWARDED_HEADERS
     }
 
     is_stream = detect_stream_from_request(content if content else None, params)
