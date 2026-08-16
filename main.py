@@ -306,6 +306,20 @@ def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict
 
 
 # -------------------------
+# OpenAI-compatible error format
+# -------------------------
+def _make_openai_error(message: str, status_code: int) -> dict:
+    """Build an error dict matching the OpenAI API error format."""
+    return {
+        "error": {
+            "message": message,
+            "type": "server_error" if status_code >= 500 else "invalid_request_error",
+            "code": status_code,
+        }
+    }
+
+
+# -------------------------
 # Error classification
 # -------------------------
 def _classify_upstream_error(status_code: int, body: str) -> str:
@@ -405,14 +419,14 @@ async def catch_all(request: Request, full_path: str):
 
     # --- Streaming requests ---
     if is_stream:
+        is_openai_req = "/openai/" in upstream_url
         async def stream_generator():
             tried_keys, logged_errors = [], []
             for _ in range(len(POOL.states)):
                 key_state = await POOL.next_available()
                 if not key_state: break
                 tried_keys.append(key_state.key[:12] + "...")
-                is_openai = "/openai/" in upstream_url
-                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai)
+                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai_req)
                 if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                     headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
@@ -431,7 +445,11 @@ async def catch_all(request: Request, full_path: str):
                             log.warning(f"Key {key_state.key[:12]}... stream {classification} (status {upstream.status_code})")
                             # client errors won't be fixed by trying another key
                             if classification == "client_error":
-                                yield body
+                                if is_openai_req:
+                                    err = _make_openai_error(body_str, upstream.status_code)
+                                    yield (f"data: {json.dumps(err)}\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+                                else:
+                                    yield body
                                 return
                             continue
 
@@ -458,7 +476,7 @@ async def catch_all(request: Request, full_path: str):
                                         stream_had_error = True
                                         logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "type": classification, "body": msg})
                                         if CONFIG.DEBUG: print(f"[DEBUG] In-stream {classification} for key {key_state.key[:12]}...: {msg}")
-                                        break 
+                                        break  # don't yield this error chunk, retry with next key
                                 except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
                             yield chunk
                         
@@ -476,21 +494,26 @@ async def catch_all(request: Request, full_path: str):
             if not tried_keys:
                 log.error("All keys are within rate limit. Could not process stream request.")
 
-            #FIXME: Roo Code doesn't understand this error
-            final_error = {"error": {"code": 502, "message": "All keys failed for streaming request.", "details": logged_errors}}
-            yield (f"data: {json.dumps(final_error)}\r\n\r\n").encode()
+            # Return an OpenAI-compatible error as final SSE event
+            err_msg = "All API keys exhausted or failed for streaming request."
+            if is_openai_req:
+                final_error = _make_openai_error(err_msg, 502)
+                yield (f"data: {json.dumps(final_error)}\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            else:
+                final_error = {"error": {"code": 502, "message": err_msg, "details": logged_errors}}
+                yield (f"data: {json.dumps(final_error)}\r\n\r\n").encode()
         
         return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 
     # --- Non-streaming requests ---
     else:
         tried, errors = [], []
+        is_openai_req = "/openai/" in upstream_url
         for _ in range(len(POOL.states)):
             key_state = await POOL.next_available()
             if not key_state: break
             tried.append(key_state.key[:12] + "...")
-            is_openai = "/openai/" in upstream_url
-            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai)
+            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state, is_openai=is_openai_req)
             if not any(k.lower() == "content-type" for k in headers_auth.keys()):
                 headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
@@ -527,7 +550,11 @@ async def catch_all(request: Request, full_path: str):
 
         if not tried:
             log.error("All keys are in backoff. Could not process request.")
+            if is_openai_req:
+                return JSONResponse(_make_openai_error("All API keys are rate-limited or in backoff. Please retry later.", 429), status_code=429)
             return JSONResponse({"error": "all keys rate-limited or in backoff"}, status_code=429)
+        if is_openai_req:
+            return JSONResponse(_make_openai_error("All API keys failed. Please retry later.", 502), status_code=502)
         return JSONResponse({"error": "no upstream key succeeded", "tried": tried, "errors": errors}, status_code=502)
 
 
