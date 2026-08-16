@@ -27,6 +27,8 @@ try:
 except ImportError:
     _HAS_TRUSTSTORE = False
 
+from collections import OrderedDict
+
 log = logging.getLogger("uvicorn")
 HTTP_CLIENT: httpx.AsyncClient = None
 
@@ -107,6 +109,28 @@ KEYS_LIST = parse_keys(CONFIG.GEMINI_API_KEYS)
 # -------------------------
 # Key state & pool (classified error handling)
 # -------------------------
+class ThoughtSignatureCache:
+    def __init__(self, capacity: int = 1000):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[str]:
+        async with self._lock:
+            if key not in self.cache:
+                return None
+            self.cache.move_to_end(key)
+            return self.cache[key]
+
+    async def put(self, key: str, value: str):
+        async with self._lock:
+            self.cache[key] = value
+            self.cache.move_to_end(key)
+            if len(self.cache) > self.capacity:
+                self.cache.popitem(last=False)
+
+THOUGHT_SIGNATURES = ThoughtSignatureCache()
+
 class KeyState:
     def __init__(self, key: str):
         self.key: str = key
@@ -398,16 +422,38 @@ async def catch_all(request: Request, full_path: str):
         if k.lower() in _FORWARDED_HEADERS
     }
 
-    if CONFIG.ENABLE_THINKING_CHAIN and content and "/openai/" in upstream_url:
+    if content and "/openai/" in upstream_url:
         try:
             body_json = json.loads(content.decode(errors="ignore"))
-            if "extra_body" not in body_json or "google" not in body_json.get("extra_body", {}):
-                body_json.setdefault("extra_body", {}).setdefault("google", {}).setdefault("thinking_config", {
-                    "thinking_budget": 32768,
-                    "include_thoughts": True
-                })
+            modified = False
+
+            # Inject cached signatures into assistant messages with tool calls
+            for message in body_json.get("messages", []):
+                if message.get("role") == "assistant" and "tool_calls" in message:
+                    for tc in message["tool_calls"]:
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            # Check if signature is missing
+                            has_sig = tc.get("extra_content", {}).get("google", {}).get("thought_signature")
+                            if not has_sig:
+                                cached_sig = await THOUGHT_SIGNATURES.get(tc_id)
+                                if cached_sig:
+                                    tc.setdefault("extra_content", {}).setdefault("google", {})["thought_signature"] = cached_sig
+                                    modified = True
+                                    if CONFIG.DEBUG:
+                                        print(f"[DEBUG] Re-injected thought_signature for tool_call {tc_id}")
+
+            # ENABLE_THINKING_CHAIN global injection
+            if CONFIG.ENABLE_THINKING_CHAIN and "reasoning_effort" not in body_json:
+                body_json["reasoning_effort"] = "high"
+                modified = True
+                if CONFIG.DEBUG:
+                    print(f"[DEBUG] Injected reasoning_effort=high (ENABLE_THINKING_CHAIN)")
+
+            if modified:
                 content = json.dumps(body_json).encode("utf-8")
-        except Exception:
+        except Exception as e:
+            if CONFIG.DEBUG: print(f"[DEBUG] Error during request parsing: {e}")
             pass
 
     is_stream = detect_stream_from_request(content if content else None, params)
@@ -455,6 +501,9 @@ async def catch_all(request: Request, full_path: str):
                             continue
 
                         is_first_chunk, stream_had_error = True, False
+                        stream_tools = {}
+                        line_buffer = b""
+                        
                         async for chunk in upstream.aiter_bytes():
                             if is_first_chunk:
                                 is_first_chunk = False
@@ -479,10 +528,42 @@ async def catch_all(request: Request, full_path: str):
                                         if CONFIG.DEBUG: print(f"[DEBUG] In-stream {classification} for key {key_state.key[:12]}...: {msg}")
                                         break  # don't yield this error chunk, retry with next key
                                 except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
+                            
                             yield chunk
                             has_yielded_chunks = True
-                        
+                            
+                            if is_openai_req:
+                                line_buffer += chunk
+                                while b'\n' in line_buffer:
+                                    line, line_buffer = line_buffer.split(b'\n', 1)
+                                    line_str = line.decode(errors='ignore').strip()
+                                    if line_str.startswith("data: ") and line_str != "data: [DONE]":
+                                        try:
+                                            data = json.loads(line_str[6:])
+                                            for choice in data.get("choices", []):
+                                                for tc in choice.get("delta", {}).get("tool_calls", []):
+                                                    tc_id = tc.get("id")
+                                                    sig = tc.get("extra_content", {}).get("google", {}).get("thought_signature")
+                                                    
+                                                    # Case 1: Google sends the whole tool_call in one chunk (no index needed)
+                                                    if tc_id and sig:
+                                                        stream_tools[tc_id] = {"id": tc_id, "sig": sig}
+                                                    # Case 2: Piecemeal streaming (needs index correlation)
+                                                    elif "index" in tc:
+                                                        idx = tc["index"]
+                                                        if idx not in stream_tools: stream_tools[idx] = {}
+                                                        if tc_id: stream_tools[idx]["id"] = tc_id
+                                                        if sig: stream_tools[idx]["sig"] = sig
+                                        except Exception: pass
+
                         if stream_had_error: continue
+                        
+                        # Save extracted signatures to cache
+                        for tc_data in stream_tools.values():
+                            if tc_data.get("id") and tc_data.get("sig"):
+                                await THOUGHT_SIGNATURES.put(tc_data["id"], tc_data["sig"])
+                                if CONFIG.DEBUG: print(f"[DEBUG] Cached thought_signature for stream tool_call {tc_data['id']}")
+
                         key_state.mark_success()
                         client_info = f" to {request.client.host}:{request.client.port}" if request.client else ""
                         log.info(f"Stream{client_info} completed successfully with key {key_state.key[:12]}...")
@@ -536,6 +617,21 @@ async def catch_all(request: Request, full_path: str):
                     key_state.mark_success()
                     client_info = f" from {request.client.host}:{request.client.port}" if request.client else ""
                     log.info(f"Request{client_info} completed successfully with key {key_state.key[:12]}...")
+
+                    if is_openai_req:
+                        try:
+                            # Cache thought signatures from synchronous responses
+                            resp_json = json.loads(resp.content.decode())
+                            for choice in resp_json.get("choices", []):
+                                for tc in choice.get("message", {}).get("tool_calls", []):
+                                    sig = tc.get("extra_content", {}).get("google", {}).get("thought_signature")
+                                    tc_id = tc.get("id")
+                                    if sig and tc_id:
+                                        await THOUGHT_SIGNATURES.put(tc_id, sig)
+                                        if CONFIG.DEBUG: print(f"[DEBUG] Cached thought_signature for tool_call {tc_id}")
+                        except Exception as e:
+                            if CONFIG.DEBUG: print(f"[DEBUG] Error extracting signatures: {e}")
+
                     return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
                 # classify the error and penalize accordingly
