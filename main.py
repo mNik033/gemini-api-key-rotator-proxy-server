@@ -431,6 +431,7 @@ async def catch_all(request: Request, full_path: str):
                     headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
                 if CONFIG.DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
+                has_yielded_chunks = False
                 try:
                     async with HTTP_CLIENT.stream(
                         request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
@@ -479,6 +480,7 @@ async def catch_all(request: Request, full_path: str):
                                         break  # don't yield this error chunk, retry with next key
                                 except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
                             yield chunk
+                            has_yielded_chunks = True
                         
                         if stream_had_error: continue
                         key_state.mark_success()
@@ -489,6 +491,15 @@ async def catch_all(request: Request, full_path: str):
                     key_state.mark_server_error()  # network issue, not the key's fault
                     logged_errors.append({"key": key_state.key[:12], "error": str(e)})
                     if CONFIG.DEBUG: print(f"[DEBUG] Network error for stream key {key_state.key[:12]}...: {e}")
+                    if has_yielded_chunks:
+                        # Cannot failover because we already sent partial response
+                        err_msg = f"Network error mid-stream: {e}. Please retry the request."
+                        if is_openai_req:
+                            err = _make_openai_error(err_msg, 502)
+                            yield (f"data: {json.dumps(err)}\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+                        else:
+                            yield (f"data: {json.dumps({'error': err_msg})}\r\n\r\n").encode()
+                        return
                     continue
             
             if not tried_keys:
